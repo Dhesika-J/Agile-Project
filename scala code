@@ -1,0 +1,176 @@
+import java.net.InetSocketAddress
+import java.nio.charset.StandardCharsets
+import java.sql.{Connection, DriverManager, PreparedStatement, ResultSet}
+import java.time.Instant
+import java.util.UUID
+import com.sun.net.httpserver.{HttpExchange, HttpHandler, HttpServer}
+import com.fasterxml.jackson.databind.{JsonNode, ObjectMapper}
+import com.fasterxml.jackson.module.scala.DefaultScalaModule
+import org.apache.spark.sql.{DataFrame, SparkSession}
+import org.apache.spark.sql.functions._
+import scala.collection.JavaConverters._
+
+object WildfireGuard {
+  private val mapper = new ObjectMapper().registerModule(DefaultScalaModule)
+  private val dbUrl = sys.env.getOrElse("MYSQL_URL", "jdbc:mysql://localhost:3306/wildfire_guard?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC")
+  private val dbUser = sys.env.getOrElse("MYSQL_USER", "root")
+  private val dbPassword = sys.env.getOrElse("MYSQL_PASSWORD", "")
+  private val port = sys.env.getOrElse("PORT", "8000").toInt
+
+  private val spark = SparkSession.builder()
+    .appName("WildfireGuardSparkProcessing")
+    .master("local[*]")
+    .config("spark.ui.enabled", "true")
+    .config("spark.sql.shuffle.partitions", "2")
+    .getOrCreate()
+  spark.sparkContext.setLogLevel("WARN")
+
+  Class.forName("com.mysql.cj.jdbc.Driver")
+
+  private def connection(): Connection = DriverManager.getConnection(dbUrl, dbUser, dbPassword)
+  private def json(x: Any): String = mapper.writeValueAsString(x)
+  private def send(ex: HttpExchange, status: Int, body: String): Unit = {
+    val bytes = body.getBytes(StandardCharsets.UTF_8)
+    ex.getResponseHeaders.add("Content-Type", "application/json; charset=utf-8")
+    ex.getResponseHeaders.add("Access-Control-Allow-Origin", "*")
+    ex.getResponseHeaders.add("Access-Control-Allow-Headers", "Content-Type")
+    ex.getResponseHeaders.add("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
+    ex.sendResponseHeaders(status, bytes.length)
+    val out = ex.getResponseBody
+    out.write(bytes); out.close()
+  }
+  private def rows(sql: String): Seq[Map[String, Any]] = {
+    val c = connection()
+    try {
+      val st = c.createStatement()
+      val rs = st.executeQuery(sql)
+      val md = rs.getMetaData
+      val b = scala.collection.mutable.ArrayBuffer[Map[String, Any]]()
+      while (rs.next()) {
+        b += (1 to md.getColumnCount).map(i => md.getColumnLabel(i) -> rs.getObject(i)).toMap
+      }
+      rs.close(); st.close(); b.toSeq
+    } finally c.close()
+  }
+  private def body(ex: HttpExchange): JsonNode =
+    mapper.readTree(ex.getRequestBody)
+  private def str(n: JsonNode, key: String, default: String = ""): String =
+    Option(n.get(key)).filterNot(_.isNull).map(_.asText()).getOrElse(default)
+  private def num(n: JsonNode, key: String, default: Double = 0.0): Double =
+    Option(n.get(key)).filterNot(_.isNull).map(_.asDouble()).getOrElse(default)
+
+  // Actual Spark SQL DataFrame pipeline: validate, cast, derive risk score and aggregate by zone.
+  private def sparkRiskAnalysis(): Seq[Map[String, Any]] = {
+    import spark.implicits._
+    val raw = rows("SELECT zone_id, temperature_c, humidity_percent, smoke_ppm, soil_moisture_percent FROM sensor_readings")
+    if (raw.isEmpty) return Seq.empty
+    val input = raw.map(r => (
+      Option(r("zone_id")).map(_.toString).getOrElse("UNKNOWN"),
+      Option(r("temperature_c")).map(_.toString.toDouble).getOrElse(0.0),
+      Option(r("humidity_percent")).map(_.toString.toDouble).getOrElse(0.0),
+      Option(r("smoke_ppm")).map(_.toString.toDouble).getOrElse(0.0),
+      Option(r("soil_moisture_percent")).map(_.toString.toDouble).getOrElse(0.0)
+    )).toDF("zone_id","temperature","humidity","smoke","soil_moisture")
+
+    val cleaned = input
+      .filter(col("zone_id").isNotNull && col("temperature").between(-20, 100) &&
+        col("humidity").between(0, 100) && col("smoke").between(0, 1000) &&
+        col("soil_moisture").between(0, 100))
+      .withColumn("temperature_factor", greatest(lit(0.0), least(lit(100.0), (col("temperature") - 25.0) * 2.5)))
+      .withColumn("humidity_factor", 100.0 - col("humidity"))
+      .withColumn("smoke_factor", greatest(lit(0.0), least(lit(100.0), col("smoke") * 1.2)))
+      .withColumn("soil_factor", 100.0 - col("soil_moisture"))
+      .withColumn("risk_score", round(
+        col("temperature_factor") * 0.25 + col("humidity_factor") * 0.20 +
+        col("smoke_factor") * 0.40 + col("soil_factor") * 0.15, 1))
+    val result = cleaned.groupBy("zone_id")
+      .agg(round(avg("temperature"),1).as("avg_temperature"),
+        round(avg("humidity"),1).as("avg_humidity"),
+        round(avg("smoke"),1).as("avg_smoke"),
+        round(avg("soil_moisture"),1).as("avg_soil_moisture"),
+        round(avg("risk_score"),1).as("risk_score"),
+        count(lit(1)).as("reading_count"))
+      .withColumn("risk_level", when(col("risk_score") >= 75,"CRITICAL")
+        .when(col("risk_score") >= 50,"HIGH")
+        .when(col("risk_score") >= 30,"MEDIUM").otherwise("LOW"))
+    result.collect().toSeq.map { r =>
+      Map("zone_id" -> r.getAs[String]("zone_id"),
+        "temperature" -> r.getAs[Double]("avg_temperature"),
+        "humidity" -> r.getAs[Double]("avg_humidity"),
+        "smoke" -> r.getAs[Double]("avg_smoke"),
+        "soil_moisture" -> r.getAs[Double]("avg_soil_moisture"),
+        "risk_score" -> r.getAs[Double]("risk_score"),
+        "risk_level" -> r.getAs[String]("risk_level"),
+        "reading_count" -> r.getAs[Long]("reading_count"))
+    }
+  }
+
+  private def route(ex: HttpExchange): Unit = {
+    val path = ex.getRequestURI.getPath
+    val method = ex.getRequestMethod
+    try {
+      if (method == "OPTIONS") { send(ex, 200, "{}"); return }
+      if (method == "GET" && path == "/api/health")
+        send(ex,200,json(Map("status"->"ONLINE","backend"->"Scala","spark"->spark.version,"database"->"MySQL")))
+      else if (method == "GET" && path == "/api/dashboard") {
+        val sensors = rows("SELECT COUNT(*) total, SUM(status='ONLINE') online FROM sensors").headOption.getOrElse(Map.empty)
+        val zones = rows("SELECT COUNT(*) total, SUM(risk_level IN ('High','Critical')) risky FROM forest_zones").headOption.getOrElse(Map.empty)
+        val rovers = rows("SELECT COUNT(*) total FROM rovers").headOption.getOrElse(Map("total"->0))
+        val hotspots = rows("SELECT COUNT(*) total FROM hotspots WHERE status NOT IN ('RESOLVED')").headOption.getOrElse(Map("total"->0))
+        val risk = sparkRiskAnalysis()
+        val maxRisk = risk.map(_("risk_score").toString.toDouble).foldLeft(0.0)(_ max _)
+        send(ex,200,json(Map("system"->Map("name"->"WILDFIRE GUARD","status"->"ONLINE","last_updated"->Instant.now.toString),
+          "forest"->Map("name"->"Western Forest Zone","total_area_km2"->250,"monitored_area_km2"->218,"coverage"->87.2),
+          "summary"->Map("active_sensors"->sensors.getOrElse("total",0),"online_sensors"->sensors.getOrElse("online",0),
+            "warning_sensors"->0,"high_risk_areas"->zones.getOrElse("risky",0),"active_rovers"->rovers("total"),
+            "hotspots"->hotspots("total"),"critical_hotspots"->0),
+          "risk"->Map("overall_score"->maxRisk,"level"->(if(maxRisk>=75)"CRITICAL" else if(maxRisk>=50)"HIGH" else "MODERATE")),
+          "alerts"->Map("critical"->0,"warning"->0),"system_health"->"OPERATIONAL")))
+      }
+      else if (method == "GET" && path == "/api/zones")
+        send(ex,200,json(rows("SELECT zone_id, zone_name, forest_name, area_km2, latitude, longitude, vegetation_density, risk_level, status FROM forest_zones")))
+      else if (method == "GET" && path == "/api/sensors")
+        send(ex,200,json(rows("SELECT s.sensor_id,s.zone_id,s.latitude,s.longitude,s.battery_percentage,s.signal_strength,s.status,r.temperature_c,r.humidity_percent,r.smoke_ppm,r.soil_moisture_percent FROM sensors s LEFT JOIN sensor_readings r ON r.reading_id=(SELECT r2.reading_id FROM sensor_readings r2 WHERE r2.sensor_id=s.sensor_id ORDER BY recorded_at DESC LIMIT 1)")))
+      else if (method == "GET" && path.matches("/api/sensors/[^/]+/readings")) {
+        val id = path.split("/")(3).replace("'","")
+        send(ex,200,json(rows(s"SELECT sensor_id,temperature_c,humidity_percent,smoke_ppm,soil_moisture_percent,recorded_at FROM sensor_readings WHERE sensor_id='${id}' ORDER BY recorded_at DESC LIMIT 100")))
+      }
+      else if (method == "GET" && path == "/api/spark/risk")
+        send(ex,200,json(sparkRiskAnalysis()))
+      else if (method == "POST" && path == "/api/sensors/reading") {
+        val n=body(ex); val id=str(n,"sensor_id","S-001")
+        val c=connection()
+        try {
+          val p=c.prepareStatement("INSERT INTO sensor_readings(reading_id,sensor_id,zone_id,temperature_c,humidity_percent,smoke_ppm,soil_moisture_percent,latitude,longitude,battery_percentage,signal_strength,recorded_at) SELECT ?,s.sensor_id,s.zone_id,?,?,?,?,s.latitude,s.longitude,?,?,NOW() FROM sensors s WHERE s.sensor_id=?")
+          p.setString(1,UUID.randomUUID.toString); p.setDouble(2,num(n,"temperature")); p.setDouble(3,num(n,"humidity"))
+          p.setDouble(4,num(n,"smoke")); p.setDouble(5,num(n,"soil_moisture")); p.setInt(6,num(n,"battery",90).toInt)
+          p.setString(7,str(n,"signal_strength","Strong")); p.setString(8,id); p.executeUpdate(); p.close()
+        } finally c.close()
+        val analysis=sparkRiskAnalysis()
+        send(ex,201,json(Map("message"->"Sensor reading stored; Spark analysis completed","spark_version"->spark.version,"risk_analysis"->analysis)))
+      }
+      else if (method == "POST" && path == "/api/rovers/dispatch") {
+        val n=body(ex); val rover=str(n,"rover_id"); val zone=str(n,"target_zone")
+        val c=connection()
+        try { val p=c.prepareStatement("INSERT INTO rover_missions(mission_id,rover_id,mission_type,target_zone,priority,status,started_at) VALUES(?,?,?,?,?,?,NOW())")
+          p.setString(1,UUID.randomUUID.toString);p.setString(2,rover);p.setString(3,"INVESTIGATION");p.setString(4,zone);p.setString(5,"HIGH");p.setString(6,"DISPATCHED");p.executeUpdate();p.close()
+        } finally c.close()
+        send(ex,200,json(Map("mission_id"->UUID.randomUUID.toString,"status"->"DISPATCHED","rover_id"->rover,"target_zone"->zone)))
+      }
+      else send(ex,404,json(Map("error"->"Endpoint not found","path"->path)))
+    } catch { case e: Exception =>
+      e.printStackTrace()
+      send(ex,500,json(Map("error"->Option(e.getMessage).getOrElse("Internal server error"))))
+    }
+  }
+
+  def main(args: Array[String]): Unit = {
+    val server=HttpServer.create(new InetSocketAddress("0.0.0.0",port),0)
+    server.createContext("/",new HttpHandler { override def handle(ex: HttpExchange): Unit = route(ex) })
+    server.setExecutor(null)
+    println(s"WILDFIRE GUARD Scala API running at http://localhost:$port")
+    println(s"Apache Spark ${spark.version} started in local mode")
+    println("Spark risk endpoint: http://localhost:8000/api/spark/risk")
+    server.start()
+  }
+}
